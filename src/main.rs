@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{Seek, Write};
 
 use chrono::Timelike;
 use crossterm::{cursor, terminal};
@@ -10,6 +12,7 @@ use tokio::time;
 
 const TIME_X: u16 = 14;
 const REFRESH_MS: u64 = 128;
+const SAVE_INTERVAL_S: u64 = 20;
 
 struct Line {
     message: StyledContent<&'static str>,
@@ -75,14 +78,18 @@ struct History {
     lines: VecDeque<Line>,
     start_row: u16,
     max_rows: u16,
+    history_file: File,
+    last_save: time::Instant,
 }
 
 impl History {
-    fn new() -> History {
+    fn new(history_file: File) -> History {
         Self {
             lines: VecDeque::new(),
             start_row: 4,
             max_rows: terminal::size().unwrap().1 - 6,
+            history_file,
+            last_save: time::Instant::now(),
         }
     }
 
@@ -93,42 +100,72 @@ impl History {
         self.len() + self.start_row
     }
 
-    fn write_line(&mut self, line: Line, stdout: &mut std::io::Stdout, advance: bool) {
+    fn update_history(&mut self) -> std::io::Result<()> {
+        // Clear the history file
+        self.history_file.seek(std::io::SeekFrom::Start(0))?;
+        self.history_file.set_len(0)?;
+        // Write the current history
+        for line in &self.lines {
+            writeln!(self.history_file, "{} {}", line.message.content(), line.timestamp.content())?;
+        }
+        Ok(())
+    }
+
+    fn write_line(&mut self, line: Line, stdout: &mut std::io::Stdout, advance: bool) -> std::io::Result<()> {
+        // Update the history file, if needed
+        let now = time::Instant::now();
+        if advance || now - self.last_save >= time::Duration::from_secs(SAVE_INTERVAL_S) {
+            self.last_save = now;
+            self.update_history()?;
+        }
+
         if !advance {
+            // Replace the current line
             line.print(stdout, u16::max(self.start_row, self.active_line() - 1));
             self.lines.pop_back();
             self.lines.push_back(line);
-            return;
+            return Ok(());
         }
+
+        // Add a new line
         if self.len() < self.max_rows {
             line.print(stdout, self.active_line());
             self.lines.push_back(line);
-            return;
+            return Ok(());
         }
+        
         self.lines.pop_front();
         self.lines.push_back(line);
+        
         // move all lines up
         execute!(
             stdout,
             cursor::MoveToRow(self.start_row),
             terminal::Clear(terminal::ClearType::FromCursorDown),
-        ).unwrap();
+        )?;
         for (i, line) in self.lines.iter().enumerate() {
             line.print(stdout, self.start_row + i as u16);
         }
+
+        Ok(())
     }
 }
 
 #[tokio::main]
-async fn main() {
-    terminal::enable_raw_mode().unwrap();
+async fn main() -> std::io::Result<()> {
+    let args = std::env::args();
+    let save_file = match args.skip(1).next() {
+        Some(filename) => File::create(filename),
+        None => File::create(".datimer.history"),
+    }?;
+
+    terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(
         stdout,
         cursor::Hide,
         terminal::Clear(crossterm::terminal::ClearType::All)
-    )
-    .unwrap();
+    )?;
 
     execute!(
         stdout,
@@ -136,8 +173,7 @@ async fn main() {
         Print("DATIMER".bold()),
         cursor::MoveTo(0, 1),
         Print("Press 'p' to pause, 'q' to quit")
-    )
-    .unwrap();
+    )?;
 
     // Create a channel for communication between tasks
     let (tx, mut rx) = mpsc::channel(1);
@@ -163,7 +199,7 @@ async fn main() {
     let mut paused = false;
     Line::from_datetime("Start time:", chrono::Local::now()).color(Color::Cyan).print(&mut stdout, 3);
 
-    let mut history = History::new();
+    let mut history = History::new(save_file);
 
     // Every REFRESH_MS ms, print the elapsed time
     // If there is a key press, exit the loop
@@ -171,7 +207,7 @@ async fn main() {
         if !paused {
             let elapsed = start.elapsed();
             let line = Line::from_duration("Elapsed:", running_total + elapsed).color(Color::Reset).bold();
-            history.write_line(line, &mut stdout, false);
+            history.write_line(line, &mut stdout, false)?;
         }
         if let Ok(c) = rx.try_recv() {
             match c {
@@ -181,16 +217,16 @@ async fn main() {
                         // resume
                         start = time::Instant::now();
                         let line = Line::from_datetime("Resumed at:", chrono::Local::now()).color(Color::Green);
-                        history.write_line(line, &mut stdout, false);
+                        history.write_line(line, &mut stdout, false)?;
                         let line = Line::from_duration("Elapsed:", running_total).color(Color::Reset).bold();
-                        history.write_line(line, &mut stdout, true);
+                        history.write_line(line, &mut stdout, true)?;
                     } else {
                         // pause
                         running_total += start.elapsed();
                         let line = Line::from_datetime("Paused at:", chrono::Local::now()).color(Color::Red);
-                        history.write_line(line, &mut stdout, false);
+                        history.write_line(line, &mut stdout, false)?;
                         let line = Line::from_duration("Elapsed:", running_total).color(Color::Reset).italic();
-                        history.write_line(line, &mut stdout, true);
+                        history.write_line(line, &mut stdout, true)?;
                     }
                     paused = !paused;
                 }
@@ -206,7 +242,8 @@ async fn main() {
         SetForegroundColor(Color::Reset),
         cursor::MoveTo(0, history.active_line() + 2),
         cursor::Show
-    )
-    .unwrap();
-    terminal::disable_raw_mode().unwrap();
+    )?;
+    terminal::disable_raw_mode()?;
+
+    Ok(())
 }
